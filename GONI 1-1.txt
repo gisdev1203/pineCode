@@ -1,0 +1,275 @@
+//
+//  ▄████  ▄▄▄       ▄▄▄▄    ▄▄▄▄    ▒█████  
+// ██▒ ▀█▒▒████▄    ▓█████▄ ▓█████▄ ▒██▒  ██▒
+//▒██░▄▄▄░▒██  ▀█▄  ▒██▒ ▄██▒██▒ ▄██▒██░  ██▒
+//░▓█  ██▓░██▄▄▄▄██ ▒██░█▀  ▒██░█▀  ▒██   ██░
+//░▒▓███▀▒ ▓█   ▓██▒░▓█  ▀█▓░▓█  ▀█▓░ ████▓▒░
+// ░▒   ▒  ▒▒   ▓▒█░░▒▓███▀▒░▒▓███▀▒░ ▒░▒░▒░ 
+//  ░   ░   ▒   ▒▒ ░▒░▒   ░ ▒░▒   ░   ░ ▒ ▒░ 
+//░ ░   ░   ░   ▒    ░    ░  ░    ░ ░ ░ ░ ▒  
+//      ░       ░  ░ ░       ░          ░ ░  
+//                        ░       ░          
+//@version=5
+strategy('Goni', 'GONI', true)
+
+// ═════════════1═════════════   VARIABLI {
+var float entryLong         =   na
+var float entryShort        =   na
+
+var float takeProfitLong    =   na
+var float takeProfitShort   =   na
+
+var float stopLossLong      =   na
+var float stopLossShort     =   na
+
+var float numTradeLong      =   na
+var float numTradeShort     =   na
+// }
+
+// ═════════════2═════════════   INDICATOR {
+leverage = input.int(5, title='Leverage', minval=1, maxval=125, group="Leverage and Risk")
+shareofport = input.float(20, title= 'Risk $', minval=0, maxval=100, step=1, group="Leverage and Risk") / 100
+
+//size = (shareofport / close * leverage)
+
+sizePos = ((strategy.equity * shareofport) * leverage) / close
+
+// ══════════════════════════   KNN {
+int startdate = timestamp('01 Jan 2000 00:00:00 GMT+10')
+int stopdate  = timestamp('31 Dec 2025 23:45:00 GMT+10')
+
+StartDate  = input.time  (startdate, 'Start Date')
+StopDate   = input.time  (stopdate,  'Stop Date')
+Indicator  = input.string('All',     'Indicator',   ['RSI','ROC','CCI','Volume','All'])
+ShortWinow = input.int   (14,        'Short Period [1..n]', 1)
+LongWindow = input.int   (28,        'Long Period [2..n]',  2)
+BaseK      = input.int   (252,       'Base No. of Neighbours (K) [5..n]', 5)
+Filter     = input.bool  (false,     'Volatility Filter')
+Bars       = input.int   (300,       'Bar Threshold [2..5000]', 2, 5000)
+
+//-- Constants
+
+var int BUY   = 1
+var int SELL  =-1
+var int CLEAR = 0
+
+var int k     = math.floor(math.sqrt(BaseK))  // k Value for kNN algo
+
+//-- Variable
+
+// Training data, normalized to the range of [0,...,100]
+var array<float> feature1   = array.new_float(0)  // [0,...,100]
+var array<float> feature2   = array.new_float(0)  //    ...
+var array<int>   directions = array.new_int(0)    // [-1; +1]
+
+// Result data
+var array<int>   predictions = array.new_int(0)
+var float        prediction  = 0.0
+var array<int>   bars        = array.new<int>(1, 0) // array used as a container for inter-bar variables
+
+// Signals
+var int          signal      = CLEAR
+
+//-- Functions
+
+minimax(float x, int p, float min, float max) => 
+    float hi = ta.highest(x, p), float lo = ta.lowest(x, p)
+    (max - min) * (x - lo)/(hi - lo) + min
+
+cAqua(int g) => g>9?#0080FFff:g>8?#0080FFe5:g>7?#0080FFcc:g>6?#0080FFb2:g>5?#0080FF99:g>4?#0080FF7f:g>3?#0080FF66:g>2?#0080FF4c:g>1?#0080FF33:#00C0FF19
+cPink(int g) => g>9?#FF0080ff:g>8?#FF0080e5:g>7?#FF0080cc:g>6?#FF0080b2:g>5?#FF008099:g>4?#FF00807f:g>3?#FF008066:g>2?#FF00804c:g>1?#FF008033:#FF008019
+
+inside_window(float start, float stop) =>  
+    time >= start and time <= stop ? true : false
+
+//-- Logic
+
+bool window = inside_window(StartDate, StopDate)
+
+// 3 pairs of predictor indicators, long and short each
+float rs = ta.rsi(close,   LongWindow),        float rf = ta.rsi(close,   ShortWinow)
+float cs = ta.cci(close,   LongWindow),        float cf = ta.cci(close,   ShortWinow)
+float os = ta.roc(close,   LongWindow),        float of = ta.roc(close,   ShortWinow)
+float vs = minimax(volume, LongWindow, 0, 99), float vf = minimax(volume, ShortWinow, 0, 99)
+
+float f1 = switch Indicator
+    'RSI'    => rs 
+    'CCI'    => cs 
+    'ROC'    => os 
+    'Volume' => vs 
+    => math.avg(rs, cs, os, vs)
+
+float f2 = switch Indicator
+    'RSI'    => rf 
+    'CCI'    => cf
+    'ROC'    => of
+    'Volume' => vf 
+    => math.avg(rf, cf, of, vf)
+
+// Classification data, what happens on the next bar
+int class_label = int(math.sign(close[1] - close[0])) // eq. close[1]<close[0] ? SELL: close[1]>close[0] ? BUY : CLEAR
+
+// Use particular training period
+if window
+    // Store everything in arrays. Features represent a square 100 x 100 matrix,
+    // whose row-colum intersections represent class labels, showing historic directions
+    array.push(feature1, f1)
+    array.push(feature2, f2)
+    array.push(directions, class_label)
+
+
+// Core logic of the algorithm
+int   size    = array.size(directions)
+float maxdist = -999.0
+// Loop through the training arrays, getting distances and corresponding directions.
+for i=0 to size-1
+    // Calculate the euclidean distance of current point to all historic points,
+    // here the metric used might as well be a manhattan distance or any other.
+    float d = math.sqrt(math.pow(f1 - array.get(feature1, i), 2) + math.pow(f2 - array.get(feature2, i), 2))
+    
+    if d > maxdist
+        maxdist := d
+        if array.size(predictions) >= k
+            array.shift(predictions)
+        array.push(predictions, array.get(directions, i))
+        
+prediction := array.sum(predictions)   
+
+bool filter = Filter ? ta.atr(10) > ta.atr(40) : true // filter out by volatility or ex. ta.atr(1) > ta.atr(10)...
+
+bool long  = prediction > 0 and filter
+bool short = prediction < 0 and filter
+bool clear = not(long and short)
+
+if array.get(bars, 0)==Bars    // stop by trade duration
+    signal := CLEAR
+    array.set(bars, 0, 0)
+else
+    array.set(bars, 0, array.get(bars, 0) + 1)
+
+signal := long ? BUY : short ? SELL : clear ? CLEAR : nz(signal[1])
+
+int  changed         = ta.change(signal)
+bool startLongTrade  = changed and signal==BUY 
+bool startShortTrade = changed and signal==SELL 
+bool clear_condition = changed and signal==CLEAR //or (changed and signal==SELL) or (changed and signal==BUY)
+
+float maxpos = ta.highest(high, 10)
+float minpos = ta.lowest (low,  10)
+
+plotshape(startLongTrade  ? minpos : na, 'Buy',      shape.labelup,   location.belowbar, cAqua(int(prediction*5)),  size=size.small)  // color intensity correction
+plotshape(startShortTrade ? maxpos : na, 'Sell',     shape.labeldown, location.abovebar, cPink(int(-prediction*5)), size=size.small)
+plot(clear_condition      ? close  : na, 'ClearPos', color.yellow, 4, plot.style_cross)
+// }
+// ══════════════════════════   Atr {
+atr1                    =   input.int(19, "ATR Period", group="Atr", inline="2")
+atr                     =   ta.atr(atr1)
+// }
+// ══════════════════════════   Session {
+sessionBool             =   input.bool(true, "Trading Times ???, ", inline="1", group="Trading Times Input")
+sessionInp              =   input.session("0900-1500:1234567", "", inline="1", group="Trading Times Input")
+sessionFill             =   input.bool(true, "Fill Session ???, ", inline="2", group="Trading Times Input")
+colorSession1           =   input.color(color.new(color.blue, 96), "Color Session", inline="2", group="Trading Times Input")
+
+sessionBool2            =   input.bool(true, "Set and Forget ???, ", inline="1", group="Set and Forget Input")
+session2Inp             =   input.session("1500-2000:1234567", "", inline="1", group="Set and Forget Input")
+tradeNum                =   input.int(1, "Trade Max Session", inline="2", group="Set and Forget Input")
+session2Fill            =   input.bool(true, "Fill Session ???, ", inline="2", group="Set and Forget Input")
+colorSession2           =   input.color(color.new(color.orange, 96), "Color Session", inline="2", group="Set and Forget Input")
+
+is_session(sess) =>
+    not na(time(timeframe.period, sess, "Europe/Berlin"))
+
+session1                =   is_session(sessionInp)
+session2                =   is_session(session2Inp)
+
+bgcolor((sessionBool? (session1 and sessionFill)? colorSession1: na: na), title="Session 1")
+bgcolor((sessionBool2? (session2 and session2Fill)? colorSession2: na: na), title="Session 2")
+// }
+// }
+
+// ═════════════3═════════════   STRATEGY {
+takeProfitMult          =   input.int(2, "Take Profit Mult", 1, 1000000, 1, inline="1", group="Strategy")
+stopLossMult            =   input.int(2, "Stop Loss Mult", 1, 1000000, 1, inline="1", group="Strategy")
+
+Long1                   =   startLongTrade and (sessionBool? session1: 1)
+Long2                   =   startLongTrade and (sessionBool2? session2: na) and (sessionBool2? numTradeLong < tradeNum: 1)
+Long                    =   Long1 or Long2
+
+Short1                  =   startShortTrade and (sessionBool? session1: 1)
+Short2                  =   startShortTrade and (sessionBool2? session2: na) and (sessionBool2? numTradeLong < tradeNum: 1)
+Short                   =   Short1 or Short2
+
+if Long and not entryLong
+    entryLong           :=  close
+    takeProfitLong      :=  entryLong + ((atr *stopLossMult) * takeProfitMult)
+    stopLossLong        :=  entryLong - (atr *stopLossMult)
+    numTradeLong        :=  session2? numTradeLong[1] + 1: 0
+    strategy.entry("Long", strategy.long, qty=sizePos, comment="Entry Long")
+    entryShort          :=  na
+    takeProfitShort     :=  na
+    stopLossShort       :=  na
+else if Short and not entryShort
+    entryShort          :=  close
+    takeProfitShort     :=  entryShort - ((atr *stopLossMult) * takeProfitMult)
+    stopLossShort       :=  entryShort + (atr *stopLossMult)
+    numTradeLong        :=  session2? numTradeLong[1] + 1: 0
+    strategy.entry("Short", strategy.short, qty=sizePos, comment="Entry Short")
+    entryLong           :=  na
+    takeProfitLong      :=  na
+    stopLossLong        :=  na
+if startShortTrade and entryLong
+    strategy.close("Long", "Close Long")
+    entryLong           :=  na
+    takeProfitLong      :=  na
+    stopLossLong        :=  na
+else if startLongTrade and entryShort
+    strategy.close("Short", "Close Short")
+    entryShort          :=  na
+    takeProfitShort     :=  na
+    stopLossShort       :=  na
+
+if strategy.position_size > 0 and strategy.position_size[1] <= 0 and not Short
+    entryLong           :=  strategy.opentrades.entry_price(strategy.opentrades - 1)
+    takeProfitLong      :=  entryLong + ((atr[1] *stopLossMult) * takeProfitMult)
+    stopLossLong        :=  entryLong - (atr[1] *stopLossMult)
+else if strategy.position_size < 0 and strategy.position_size[1] >= 0 and not Long
+    entryShort          :=  strategy.opentrades.entry_price(strategy.opentrades - 1)
+    takeProfitShort     :=  entryShort - ((atr[1] *stopLossMult) * takeProfitMult)
+    stopLossShort       :=  entryShort + (atr[1] *stopLossMult)
+else if (strategy.position_size[1] > 0 and strategy.position_size <= 0) or (Long[1] and strategy.position_size <= 0)
+    entryLong           :=  na
+    takeProfitLong      :=  na
+    stopLossLong        :=  na
+else if (strategy.position_size[1] < 0 and strategy.position_size >= 0) or (Short[1] and strategy.position_size >= 0)
+    entryShort          :=  na
+    takeProfitShort     :=  na
+    stopLossShort       :=  na
+
+strategy.exit("Exit Long", "Long", limit=takeProfitLong, stop=stopLossLong, comment_profit = "TP ✅", comment_loss = "SL ❌")
+strategy.exit("Exit Short", "Short", limit=takeProfitShort, stop=stopLossShort, comment_profit = "TP ✅", comment_loss = "SL ❌")
+
+// }
+// ═════════════5═════════════   PLOT {
+plotPosizionLong        =   input.bool(true, "Plot Posizion Long ???", inline="1", group="Plot")
+plotPosizionShort       =   input.bool(true, "Plot Posizion Short ???", inline="1", group="Plot")
+
+plotshape(Long and not Long[1], "Long", shape.labelup, location.bottom, color.green, 0, "Buy", color.white, size=size.normal)
+plotshape(Short and not Short[1], "Short", shape.labeldown, location.top, color.red, 0, "Sell", color.white, size=size.normal)
+
+
+plotEntryLong = plot(entryLong, "Entry Long", color.new(color.white, 40), 2, plot.style_linebr, display=plotPosizionLong? display.all: display.none)
+plotTakeProfitLong = plot(takeProfitLong, "Take Profit Long", color.new(color.green, 40), 2, plot.style_linebr, display=plotPosizionLong? display.all: display.none)
+plotStopLossLong = plot(stopLossLong, "Stop Loss Long", color.new(color.red, 40), 2, plot.style_linebr, display=plotPosizionLong? display.all: display.none)
+
+plotEntryShort = plot(entryShort, "Entry Short", color.new(color.white, 40), 2, plot.style_linebr, display=plotPosizionShort? display.all: display.none)
+plotTakeProfitShort = plot(takeProfitShort, "Take Profit Short", color.new(color.green, 40), 2, plot.style_linebr, display=plotPosizionShort? display.all: display.none)
+plotStopLossShort = plot(stopLossShort, "Stop Loss Short", color.new(color.red, 40), 2, plot.style_linebr, display=plotPosizionShort? display.all: display.none)
+
+fill(plotEntryLong, plotTakeProfitLong, color.new(color.green, 80), "Fill Take Profit Long", display=plotPosizionLong? display.all: display.none)
+fill(plotEntryLong, plotStopLossLong, color.new(color.red, 80), "Fill Stop Loss Long", display=plotPosizionLong? display.all: display.none)
+
+fill(plotEntryShort, plotTakeProfitShort, color.new(color.green, 80), "Fill Take Profit Short", display=plotPosizionShort? display.all: display.none)
+fill(plotEntryShort, plotStopLossShort, color.new(color.red, 80), "Fill Stop Loss Long", display=plotPosizionShort? display.all: display.none)
+
+// }
